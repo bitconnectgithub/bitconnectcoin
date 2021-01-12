@@ -357,7 +357,7 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
         nLastBlockSize = nBlockSize;
 
         if (fDebug && GetBoolArg("-printpriority"))
-            printf("CreateNewBlock(): total size %"PRIu64"\n", nBlockSize);
+            printf("CreateNewBlock(): total size %"PRI64u"\n", nBlockSize);
 
         if (!fProofOfStake)
             pblock->vtx[0].vout[0].nValue = GetProofOfWorkReward(nFees);
@@ -536,7 +536,7 @@ void StakeMiner(CWallet *pwallet)
         while (pwallet->IsLocked())
         {
             nLastCoinStakeSearchInterval = 0;
-            MilliSleep(1000);
+            Sleep(1000);
             if (fShutdown)
                 return;
         }
@@ -545,7 +545,7 @@ void StakeMiner(CWallet *pwallet)
         {
             nLastCoinStakeSearchInterval = 0;
             fTryToSync = true;
-            MilliSleep(1000);
+            Sleep(1000);
             if (fShutdown)
                 return;
         }
@@ -555,7 +555,7 @@ void StakeMiner(CWallet *pwallet)
             fTryToSync = false;
             if (vNodes.size() < 3 || nBestHeight < GetNumBlocksOfPeers())
             {
-                MilliSleep(60000);
+                Sleep(60000);
                 continue;
             }
         }
@@ -574,9 +574,9 @@ void StakeMiner(CWallet *pwallet)
             SetThreadPriority(THREAD_PRIORITY_NORMAL);
             CheckStake(pblock.get(), *pwallet);
             SetThreadPriority(THREAD_PRIORITY_LOWEST);
-            MilliSleep(500);
+            Sleep(500);
         }
         else
-            MilliSleep(nMinerSleep);
+            Sleep(nMinerSleep);
     }
 }

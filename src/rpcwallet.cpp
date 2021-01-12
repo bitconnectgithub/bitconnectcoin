@@ -382,12 +382,12 @@ Value signmessage(const Array& params, bool fHelp)
     if (!pwalletMain->GetKey(keyID, key))
         throw JSONRPCError(RPC_WALLET_ERROR, "Private key not available");
 
-    CDataStream ss(SER_GETHASH, 0);
+    CHashWriter ss(SER_GETHASH, 0);
     ss << strMessageMagic;
     ss << strMessage;
 
     vector<unsigned char> vchSig;
-    if (!key.SignCompact(Hash(ss.begin(), ss.end()), vchSig))
+    if (!key.SignCompact(ss.GetHash(), vchSig))
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Sign failed");
 
     return EncodeBase64(&vchSig[0], vchSig.size());
@@ -418,12 +418,12 @@ Value verifymessage(const Array& params, bool fHelp)
     if (fInvalid)
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Malformed base64 encoding");
 
-    CDataStream ss(SER_GETHASH, 0);
+    CHashWriter ss(SER_GETHASH, 0);
     ss << strMessageMagic;
     ss << strMessage;
 
     CKey key;
-    if (!key.SetCompactSignature(Hash(ss.begin(), ss.end()), vchSig))
+    if (!key.SetCompactSignature(ss.GetHash(), vchSig))
         return false;
 
     return (key.GetPubKey().GetID() == keyID);
@@ -1352,7 +1352,7 @@ Value keypoolrefill(const Array& params, bool fHelp)
             "Fills the keypool."
             + HelpRequiringPassphrase());
 
-    unsigned int nSize = max(GetArg("-keypool", 100), (int64_t)0);
+    unsigned int nSize = max(GetArg("-keypool", 100), (int64)0);
     if (params.size() > 0) {
         if (params[0].get_int() < 0)
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, expected valid size");
@@ -1400,7 +1400,7 @@ void ThreadCleanWalletPassphrase(void* parg)
                 break;
 
             LEAVE_CRITICAL_SECTION(cs_nWalletUnlockTime);
-            MilliSleep(nToSleep);
+            Sleep(nToSleep);
             ENTER_CRITICAL_SECTION(cs_nWalletUnlockTime);
 
         } while(1);

@@ -10,7 +10,6 @@
 #include "net.h"
 #include "script.h"
 #include "scrypt.h"
-#include "zerocoin/Zerocoin.h"
 
 #include <list>
 
@@ -57,10 +56,9 @@ static const int64_t COIN_YEAR_REWARD = 10 * CENT;
 static const uint256 hashGenesisBlock("0x00000d3bd95c47fa17c47e1e2732d7072a6c4014a2fa93873124418a8fd9a300");
 static const uint256 hashGenesisBlockTestNet("0x00000d3bd95c47fa17c47e1e2732d7072a6c4014a2fa93873124418a8fd9a300");
 
-inline int64_t PastDrift(int64_t nTime)   { return nTime - 10 * 60; } // up to 10 minutes from the past
-inline int64_t FutureDrift(int64_t nTime) { return nTime + 10 * 60; } // up to 10 minutes from the future
+inline int64 PastDrift(int64 nTime)   { return nTime - 10 * 60; } // up to 10 minutes from the past
+inline int64 FutureDrift(int64 nTime) { return nTime + 10 * 60; } // up to 10 minutes from the future
 
-extern libzerocoin::Params* ZCParams;
 extern CScript COINBASE_FLAGS;
 extern CCriticalSection cs_main;
 extern std::map<uint256, CBlockIndex*> mapBlockIndex;
@@ -85,6 +83,7 @@ extern int64_t nTimeBestReceived;
 extern CCriticalSection cs_setpwalletRegistered;
 extern std::set<CWallet*> setpwalletRegistered;
 extern unsigned char pchMessageStart[4];
+extern bool fImporting;
 extern std::map<uint256, CBlock*> mapOrphanBlocks;
 
 // Settings
@@ -115,7 +114,7 @@ void PrintBlockTree();
 CBlockIndex* FindBlockByHeight(int nHeight);
 bool ProcessMessages(CNode* pfrom);
 bool SendMessages(CNode* pto, bool fSendTrickle);
-bool LoadExternalBlockFile(FILE* fileIn);
+void ThreadImport(void *parg);
 
 bool CheckProofOfWork(uint256 hash, unsigned int nBits);
 unsigned int GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfStake);
@@ -678,6 +677,7 @@ public:
                        const CBlockIndex* pindexBlock, bool fBlock, bool fMiner);
     bool CheckTransaction() const;
     bool GetCoinAge(CTxDB& txdb, uint64_t& nCoinAge) const;  // ppcoin: get transaction coin age
+    const CTxOut& GetOutput(const CTxIn& input, const MapPrevTx& inputs) const;
 
 protected:
     const CTxOut& GetOutputFor(const CTxIn& input, const MapPrevTx& inputs) const;
@@ -691,6 +691,84 @@ bool IsStandardTx(const CTransaction& tx);
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight = 0, int64_t nBlockTime = 0);
 
 
+/** wrapper for CTxOut that provides a more compact serialization */
+class CTxOutCompressor
+{
+private:
+    CTxOut &txout;
+public:
+    static uint64 CompressAmount(uint64 nAmount);
+    static uint64 DecompressAmount(uint64 nAmount);
+
+    CTxOutCompressor(CTxOut &txoutIn) : txout(txoutIn) { }
+
+    IMPLEMENT_SERIALIZE(({
+        if (!fRead) {
+            uint64 nVal = CompressAmount(txout.nValue);
+            READWRITE(VARINT(nVal));
+        } else {
+            uint64 nVal = 0;
+            READWRITE(VARINT(nVal));
+            txout.nValue = DecompressAmount(nVal);
+        }
+        CScriptCompressor cscript(REF(txout.scriptPubKey));
+        READWRITE(cscript);
+    });)
+};
+
+/** Undo information for a CTxIn
+ *
+ *  Contains the prevout's CTxOut being spent, and if this was the
+ *  last output of the affected transaction, its metadata as well
+ *  (coinbase or not, height, transaction version)
+ */
+class CTxInUndo
+{
+public:
+    CTxOut txout;         // the txout data before being spent
+    bool fCoinBase;       // if the outpoint was the last unspent: whether it belonged to a coinbase
+    unsigned int nHeight; // if the outpoint was the last unspent: its height
+    int nVersion;         // if the outpoint was the last unspent: its version
+
+    CTxInUndo() : txout(), fCoinBase(false), nHeight(0), nVersion(0) {}
+    CTxInUndo(const CTxOut &txoutIn, bool fCoinBaseIn = false, unsigned int nHeightIn = 0, int nVersionIn = 0) : txout(txoutIn), fCoinBase(fCoinBaseIn), nHeight(nHeightIn), nVersion(nVersionIn) { }
+
+    unsigned int GetSerializeSize(int nType, int nVersion) const {
+        return ::GetSerializeSize(VARINT(nHeight*2+(fCoinBase ? 1 : 0)), nType, nVersion) +
+               (nHeight > 0 ? ::GetSerializeSize(VARINT(this->nVersion), nType, nVersion) : 0) +
+               ::GetSerializeSize(CTxOutCompressor(REF(txout)), nType, nVersion);
+    }
+
+    template<typename Stream>
+    void Serialize(Stream &s, int nType, int nVersion) const {
+        ::Serialize(s, VARINT(nHeight*2+(fCoinBase ? 1 : 0)), nType, nVersion);
+        if (nHeight > 0)
+            ::Serialize(s, VARINT(this->nVersion), nType, nVersion);
+        ::Serialize(s, CTxOutCompressor(REF(txout)), nType, nVersion);
+    }
+
+    template<typename Stream>
+    void Unserialize(Stream &s, int nType, int nVersion) {
+        unsigned int nCode = 0;
+        ::Unserialize(s, VARINT(nCode), nType, nVersion);
+        nHeight = nCode / 2;
+        fCoinBase = nCode & 1;
+        if (nHeight > 0)
+            ::Unserialize(s, VARINT(this->nVersion), nType, nVersion);
+        ::Unserialize(s, REF(CTxOutCompressor(REF(txout))), nType, nVersion);
+    }
+};
+
+/** Undo information for a CTransaction */
+class CTxUndo
+{
+public:
+    std::vector<CTxInUndo> vprevout;
+
+    IMPLEMENT_SERIALIZE(
+        READWRITE(vprevout);
+    )
+};
 
 /** A transaction with a merkle branch linking it to the block chain. */
 class CMerkleTx : public CTransaction
@@ -900,9 +978,9 @@ public:
         return scrypt_blockhash(CVOIDBEGIN(nVersion));
     }
 
-    int64_t GetBlockTime() const
+    int64 GetBlockTime() const
     {
-        return (int64_t)nTime;
+        return (int64)nTime;
     }
 
     void UpdateTime(const CBlockIndex* pindexPrev);
@@ -934,11 +1012,11 @@ public:
     }
 
     // ppcoin: get max transaction timestamp
-    int64_t GetMaxTransactionTime() const
+    int64 GetMaxTransactionTime() const
     {
-        int64_t maxTransactionTime = 0;
+        int64 maxTransactionTime = 0;
         BOOST_FOREACH(const CTransaction& tx, vtx)
-            maxTransactionTime = std::max(maxTransactionTime, (int64_t)tx.nTime);
+            maxTransactionTime = std::max(maxTransactionTime, (int64)tx.nTime);
         return maxTransactionTime;
     }
 
@@ -1111,7 +1189,7 @@ public:
     int64_t nMoneySupply;
 
     unsigned int nFlags;  // ppcoin: block index flags
-    enum  
+    enum
     {
         BLOCK_PROOF_OF_STAKE = (1 << 0), // is proof-of-stake block
         BLOCK_STAKE_ENTROPY  = (1 << 1), // entropy bit for stake modifier
@@ -1211,9 +1289,9 @@ public:
         return *phashBlock;
     }
 
-    int64_t GetBlockTime() const
+    int64 GetBlockTime() const
     {
-        return (int64_t)nTime;
+        return (int64)nTime;
     }
 
     uint256 GetBlockTrust() const;
@@ -1228,18 +1306,18 @@ public:
         return true;
     }
 
-    int64_t GetPastTimeLimit() const
+    int64 GetPastTimeLimit() const
     {
         return GetMedianTimePast();
     }
 
     enum { nMedianTimeSpan=11 };
 
-    int64_t GetMedianTimePast() const
+    int64 GetMedianTimePast() const
     {
-        int64_t pmedian[nMedianTimeSpan];
-        int64_t* pbegin = &pmedian[nMedianTimeSpan];
-        int64_t* pend = &pmedian[nMedianTimeSpan];
+        int64 pmedian[nMedianTimeSpan];
+        int64* pbegin = &pmedian[nMedianTimeSpan];
+        int64* pend = &pmedian[nMedianTimeSpan];
 
         const CBlockIndex* pindex = this;
         for (int i = 0; i < nMedianTimeSpan && pindex; i++, pindex = pindex->pprev)
@@ -1299,11 +1377,11 @@ public:
 
     std::string ToString() const
     {
-        return strprintf("CBlockIndex(nprev=%p, pnext=%p, nFile=%u, nBlockPos=%-6d nHeight=%d, nMint=%s, nMoneySupply=%s, nFlags=(%s)(%d)(%s), nStakeModifier=%016"PRIx64", nStakeModifierChecksum=%08x, hashProof=%s, prevoutStake=(%s), nStakeTime=%d merkle=%s, hashBlock=%s)",
+        return strprintf("CBlockIndex(nprev=%p, pnext=%p, nFile=%u, nBlockPos=%-6d nHeight=%d, nMint=%s, nMoneySupply=%s, nFlags=(%s)(%d)(%s), nStakeModifier=%016"PRI64x", nStakeModifierChecksum=%08x, hashProof=%s, prevoutStake=(%s), nStakeTime=%d merkle=%s, hashBlock=%s)",
             pprev, pnext, nFile, nBlockPos, nHeight,
             FormatMoney(nMint).c_str(), FormatMoney(nMoneySupply).c_str(),
             GeneratedStakeModifier() ? "MOD" : "-", GetStakeEntropyBit(), IsProofOfStake()? "PoS" : "PoW",
-            nStakeModifier, nStakeModifierChecksum, 
+            nStakeModifier, nStakeModifierChecksum,
             hashProof.ToString().c_str(),
             prevoutStake.ToString().c_str(), nStakeTime,
             hashMerkleRoot.ToString().c_str(),

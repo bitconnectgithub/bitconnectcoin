@@ -10,7 +10,6 @@
 #include "util.h"
 #include "ui_interface.h"
 #include "checkpoints.h"
-#include "zerocoin/ZeroTest.h"
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <boost/filesystem/convenience.hpp>
@@ -44,7 +43,7 @@ enum Checkpoints::CPMode CheckpointsMode;
 void ExitTimeout(void* parg)
 {
 #ifdef WIN32
-    MilliSleep(5000);
+    Sleep(5000);
     ExitProcess(0);
 #endif
 }
@@ -90,7 +89,7 @@ void Shutdown(void* parg)
         UnregisterWallet(pwalletMain);
         delete pwalletMain;
         NewThread(ExitTimeout, NULL);
-        MilliSleep(50);
+        Sleep(50);
         printf("bitconnect exited\n\n");
         fExit = true;
 #ifndef QT_GUI
@@ -101,8 +100,8 @@ void Shutdown(void* parg)
     else
     {
         while (!fExit)
-            MilliSleep(500);
-        MilliSleep(100);
+            Sleep(500);
+        Sleep(100);
         ExitThread(0);
     }
 }
@@ -693,7 +692,7 @@ bool AppInit2()
     BOOST_FOREACH(string strDest, mapMultiArgs["-seednode"])
         AddOneShot(strDest);
 
-    // ********************************************************* Step 7: load blockchain
+    // ********************************************************* Step 7: load block chain
 
     if (!bitdb.Open(GetDataDir()))
     {
@@ -726,7 +725,7 @@ bool AppInit2()
         printf("Shutdown requested. Exiting.\n");
         return false;
     }
-    printf(" block index %15"PRId64"ms\n", GetTimeMillis() - nStart);
+    printf(" block index %15"PRI64d"ms\n", GetTimeMillis() - nStart);
 
     if (GetBoolArg("-printblockindex") || GetBoolArg("-printblocktree"))
     {
@@ -757,15 +756,6 @@ bool AppInit2()
         return false;
     }
 
-    // ********************************************************* Testing Zerocoin
-
-
-    if (GetBoolArg("-zerotest", false))
-    {
-        printf("\n=== ZeroCoin tests start ===\n");
-        Test_RunAllTests();
-        printf("=== ZeroCoin tests end ===\n\n");
-    }
 
     // ********************************************************* Step 8: load wallet
 
@@ -827,7 +817,7 @@ bool AppInit2()
     }
 
     printf("%s", strErrors.str().c_str());
-    printf(" wallet      %15"PRId64"ms\n", GetTimeMillis() - nStart);
+    printf(" wallet      %15"PRI64d"ms\n", GetTimeMillis() - nStart);
 
     RegisterWallet(pwalletMain);
 
@@ -847,35 +837,19 @@ bool AppInit2()
         printf("Rescanning last %i blocks (from block %i)...\n", pindexBest->nHeight - pindexRescan->nHeight, pindexRescan->nHeight);
         nStart = GetTimeMillis();
         pwalletMain->ScanForWalletTransactions(pindexRescan, true);
-        printf(" rescan      %15"PRId64"ms\n", GetTimeMillis() - nStart);
+        printf(" rescan      %15"PRI64d"ms\n", GetTimeMillis() - nStart);
     }
 
     // ********************************************************* Step 9: import blocks
 
+    std::vector<boost::filesystem::path> *vPath = new std::vector<boost::filesystem::path>();
     if (mapArgs.count("-loadblock"))
     {
-        uiInterface.InitMessage(_("Importing blockchain data file."));
 
         BOOST_FOREACH(string strFile, mapMultiArgs["-loadblock"])
-        {
-            FILE *file = fopen(strFile.c_str(), "rb");
-            if (file)
-                LoadExternalBlockFile(file);
-        }
-        exit(0);
+            vPath->push_back(strFile);
     }
-
-    filesystem::path pathBootstrap = GetDataDir() / "bootstrap.dat";
-    if (filesystem::exists(pathBootstrap)) {
-        uiInterface.InitMessage(_("Importing bootstrap blockchain data file."));
-
-        FILE *file = fopen(pathBootstrap.string().c_str(), "rb");
-        if (file) {
-            filesystem::path pathBootstrapOld = GetDataDir() / "bootstrap.dat.old";
-            LoadExternalBlockFile(file);
-            RenameOver(pathBootstrap, pathBootstrapOld);
-        }
-    }
+    NewThread(ThreadImport, vPath);
 
     // ********************************************************* Step 10: load peers
 
@@ -889,7 +863,7 @@ bool AppInit2()
             printf("Invalid or missing peers.dat; recreating\n");
     }
 
-    printf("Loaded %i addresses from peers.dat  %"PRId64"ms\n",
+    printf("Loaded %i addresses from peers.dat  %"PRI64d"ms\n",
            addrman.size(), GetTimeMillis() - nStart);
 
     // ********************************************************* Step 11: start node
@@ -927,7 +901,7 @@ bool AppInit2()
     // Loop until process is exit()ed from shutdown() function,
     // called from ThreadRPCServer thread when a "stop" command is received.
     while (1)
-        MilliSleep(5000);
+        Sleep(5000);
 #endif
 
     return true;

@@ -5,10 +5,11 @@
 
 #include "util.h"
 #include "sync.h"
-#include "strlcpy.h"
 #include "version.h"
 #include "ui_interface.h"
 #include <boost/algorithm/string/join.hpp>
+#include <boost/algorithm/string/case_conv.hpp> // for to_lower()
+#include <boost/algorithm/string/predicate.hpp> // for startswith() and endswith()
 
 // Work around clang compilation problem in Boost 1.46:
 // /usr/include/boost/program_options/detail/config_file.hpp:163:17: error: call to function 'to_internal' that is neither visible in the template definition nor found by argument-dependent lookup
@@ -63,7 +64,7 @@ bool fDebug = false;
 bool fDebugNet = false;
 bool fPrintToConsole = false;
 bool fPrintToDebugger = false;
-bool fRequestShutdown = false;
+volatile bool fRequestShutdown = false;
 bool fShutdown = false;
 bool fDaemon = false;
 bool fServer = false;
@@ -72,8 +73,8 @@ string strMiscWarning;
 bool fTestNet = false;
 bool fNoListen = false;
 bool fLogTimestamps = false;
-CMedianFilter<int64_t> vTimeOffsets(200,0);
-bool fReopenDebugLog = false;
+CMedianFilter<int64> vTimeOffsets(200,0);
+volatile bool fReopenDebugLog = false;
 
 // Init OpenSSL library multithreading support
 static CCriticalSection** ppmutexOpenSSL;
@@ -129,7 +130,7 @@ instance_of_cinit;
 void RandAddSeed()
 {
     // Seed with CPU performance counter
-    int64_t nCounter = GetPerformanceCounter();
+    int64 nCounter = GetPerformanceCounter();
     RAND_add(&nCounter, sizeof(nCounter), 1.5);
     memset(&nCounter, 0, sizeof(nCounter));
 }
@@ -139,7 +140,7 @@ void RandAddSeedPerfmon()
     RandAddSeed();
 
     // This can take up to 2 seconds, so only do it every 10 minutes
-    static int64_t nLastPerfmon;
+    static int64 nLastPerfmon;
     if (GetTime() < nLastPerfmon + 10 * 60)
         return;
     nLastPerfmon = GetTime();
@@ -155,21 +156,21 @@ void RandAddSeedPerfmon()
     if (ret == ERROR_SUCCESS)
     {
         RAND_add(pdata, nSize, nSize/100.0);
-        memset(pdata, 0, nSize);
+        OPENSSL_cleanse(pdata, nSize);
         printf("RandAddSeed() %lu bytes\n", nSize);
     }
 #endif
 }
 
-uint64_t GetRand(uint64_t nMax)
+uint64 GetRand(uint64 nMax)
 {
     if (nMax == 0)
         return 0;
 
     // The range of the random source must be a multiple of the modulus
     // to give every possible output value an equal possibility
-    uint64_t nRange = (std::numeric_limits<uint64_t>::max() / nMax) * nMax;
-    uint64_t nRand = 0;
+    uint64 nRange = (std::numeric_limits<uint64>::max() / nMax) * nMax;
+    uint64 nRand = 0;
     do
         RAND_bytes((unsigned char*)&nRand, sizeof(nRand));
     while (nRand >= nRange);
@@ -194,7 +195,35 @@ uint256 GetRandHash()
 
 
 
-inline int OutputDebugStringF(const char* pszFormat, ...)
+//
+// OutputDebugStringF (aka printf -- there is a #define that we really
+// should get rid of one day) has been broken a couple of times now
+// by well-meaning people adding mutexes in the most straightforward way.
+// It breaks because it may be called by global destructors during shutdown.
+// Since the order of destruction of static/global objects is undefined,
+// defining a mutex as a global object doesn't work (the mutex gets
+// destroyed, and then some later destructor calls OutputDebugStringF,
+// maybe indirectly, and you get a core dump at shutdown trying to lock
+// the mutex).
+
+static boost::once_flag debugPrintInitFlag = BOOST_ONCE_INIT;
+// We use boost::call_once() to make sure these are initialized in
+// in a thread-safe manner the first time it is called:
+static FILE* fileout = NULL;
+static boost::mutex* mutexDebugLog = NULL;
+
+static void DebugPrintInit()
+{
+    assert(fileout == NULL);
+    assert(mutexDebugLog == NULL);
+
+    boost::filesystem::path pathDebug = GetDataDir() / "debug.log";
+    fileout = fopen(pathDebug.string().c_str(), "a");
+    if (fileout) setbuf(fileout, NULL); // unbuffered
+
+    mutexDebugLog = new boost::mutex();
+}
+int OutputDebugStringF(const char* pszFormat, ...)
 {
     int ret = 0;
     if (fPrintToConsole)
@@ -202,53 +231,39 @@ inline int OutputDebugStringF(const char* pszFormat, ...)
         // print to console
         va_list arg_ptr;
         va_start(arg_ptr, pszFormat);
-        ret = vprintf(pszFormat, arg_ptr);
+        ret += vprintf(pszFormat, arg_ptr);
         va_end(arg_ptr);
     }
     else if (!fPrintToDebugger)
     {
-        // print to debug.log
-        static FILE* fileout = NULL;
+        static bool fStartedNewLine = true;
+        boost::call_once(&DebugPrintInit, debugPrintInitFlag);
 
-        if (!fileout)
-        {
+        if (fileout == NULL)
+            return ret;
+
+        boost::mutex::scoped_lock scoped_lock(*mutexDebugLog);
+
+        // reopen the log file, if requested
+        if (fReopenDebugLog) {
+            fReopenDebugLog = false;
             boost::filesystem::path pathDebug = GetDataDir() / "debug.log";
-            fileout = fopen(pathDebug.string().c_str(), "a");
-            if (fileout) setbuf(fileout, NULL); // unbuffered
+            if (freopen(pathDebug.string().c_str(),"a",fileout) != NULL)
+                setbuf(fileout, NULL); // unbuffered
         }
-        if (fileout)
-        {
-            static bool fStartedNewLine = true;
 
-            // This routine may be called by global destructors during shutdown.
-            // Since the order of destruction of static/global objects is undefined,
-            // allocate mutexDebugLog on the heap the first time this routine
-            // is called to avoid crashes during shutdown.
-            static boost::mutex* mutexDebugLog = NULL;
-            if (mutexDebugLog == NULL) mutexDebugLog = new boost::mutex();
-            boost::mutex::scoped_lock scoped_lock(*mutexDebugLog);
+        // Debug print useful for profiling
+        if (fLogTimestamps && fStartedNewLine)
+            ret += fprintf(fileout, "%s ", DateTimeStrFormat("%Y-%m-%d %H:%M:%S", GetTime()).c_str());
+        if (pszFormat[strlen(pszFormat) - 1] == '\n')
+            fStartedNewLine = true;
+        else
+            fStartedNewLine = false;
 
-            // reopen the log file, if requested
-            if (fReopenDebugLog) {
-                fReopenDebugLog = false;
-                boost::filesystem::path pathDebug = GetDataDir() / "debug.log";
-                if (freopen(pathDebug.string().c_str(),"a",fileout) != NULL)
-                    setbuf(fileout, NULL); // unbuffered
-            }
-
-            // Debug print useful for profiling
-            if (fLogTimestamps && fStartedNewLine)
-                fprintf(fileout, "%s ", DateTimeStrFormat("%x %H:%M:%S", GetTime()).c_str());
-            if (pszFormat[strlen(pszFormat) - 1] == '\n')
-                fStartedNewLine = true;
-            else
-                fStartedNewLine = false;
-
-            va_list arg_ptr;
-            va_start(arg_ptr, pszFormat);
-            ret = vfprintf(fileout, pszFormat, arg_ptr);
-            va_end(arg_ptr);
-        }
+        va_list arg_ptr;
+        va_start(arg_ptr, pszFormat);
+        ret += vfprintf(fileout, pszFormat, arg_ptr);
+        va_end(arg_ptr);
     }
 
 #ifdef WIN32
@@ -271,6 +286,7 @@ inline int OutputDebugStringF(const char* pszFormat, ...)
             {
                 OutputDebugStringA(buffer.substr(line_start, line_end - line_start).c_str());
                 line_start = line_end + 1;
+                ret += line_end-line_start;
             }
             buffer.erase(0, line_start);
         }
@@ -359,14 +375,14 @@ void ParseString(const string& str, char c, vector<string>& v)
 }
 
 
-string FormatMoney(int64_t n, bool fPlus)
+string FormatMoney(int64 n, bool fPlus)
 {
     // Note: not using straight sprintf here because we do NOT want
     // localized number formatting.
-    int64_t n_abs = (n > 0 ? n : -n);
-    int64_t quotient = n_abs/COIN;
-    int64_t remainder = n_abs%COIN;
-    string str = strprintf("%"PRId64".%08"PRId64, quotient, remainder);
+    int64 n_abs = (n > 0 ? n : -n);
+    int64 quotient = n_abs/COIN;
+    int64 remainder = n_abs%COIN;
+    string str = strprintf("%"PRI64d".%08"PRI64d, quotient, remainder);
 
     // Right-trim excess zeros before the decimal point:
     int nTrim = 0;
@@ -391,7 +407,7 @@ bool ParseMoney(const string& str, int64_t& nRet)
 bool ParseMoney(const char* pszIn, int64_t& nRet)
 {
     string strWhole;
-    int64_t nUnits = 0;
+    int64 nUnits = 0;
     const char* p = pszIn;
     while (isspace(*p))
         p++;
@@ -400,7 +416,7 @@ bool ParseMoney(const char* pszIn, int64_t& nRet)
         if (*p == '.')
         {
             p++;
-            int64_t nMult = CENT*10;
+            int64 nMult = CENT*10;
             while (isdigit(*p) && (nMult > 0))
             {
                 nUnits += nMult * (*p++ - '0');
@@ -421,8 +437,8 @@ bool ParseMoney(const char* pszIn, int64_t& nRet)
         return false;
     if (nUnits < 0 || nUnits > COIN)
         return false;
-    int64_t nWhole = atoi64(strWhole);
-    int64_t nValue = nWhole*COIN + nUnits;
+    int64 nWhole = atoi64(strWhole);
+    int64 nValue = nWhole*COIN + nUnits;
 
     nRet = nValue;
     return true;
@@ -504,24 +520,24 @@ void ParseParameters(int argc, const char* const argv[])
     mapMultiArgs.clear();
     for (int i = 1; i < argc; i++)
     {
-        char psz[10000];
-        strlcpy(psz, argv[i], sizeof(psz));
-        char* pszValue = (char*)"";
-        if (strchr(psz, '='))
+        std::string str(argv[i]);
+        std::string strValue;
+        size_t is_index = str.find('=');
+        if (is_index != std::string::npos)
         {
-            pszValue = strchr(psz, '=');
-            *pszValue++ = '\0';
+            strValue = str.substr(is_index+1);
+            str = str.substr(0, is_index);
         }
-        #ifdef WIN32
-        _strlwr(psz);
-        if (psz[0] == '/')
-            psz[0] = '-';
-        #endif
-        if (psz[0] != '-')
+#ifdef WIN32
+        boost::to_lower(str);
+        if (boost::algorithm::starts_with(str, "/"))
+            str = "-" + str.substr(1);
+#endif
+        if (str[0] != '-')
             break;
 
-        mapArgs[psz] = pszValue;
-        mapMultiArgs[psz].push_back(pszValue);
+        mapArgs[str] = strValue;
+        mapMultiArgs[str].push_back(strValue);
     }
 
     // New 0.6 features:
@@ -550,7 +566,7 @@ std::string GetArg(const std::string& strArg, const std::string& strDefault)
     return strDefault;
 }
 
-int64_t GetArg(const std::string& strArg, int64_t nDefault)
+int64 GetArg(const std::string& strArg, int64 nDefault)
 {
     if (mapArgs.count(strArg))
         return atoi64(mapArgs[strArg]);
@@ -965,6 +981,12 @@ static std::string FormatException(std::exception* pex, const char* pszThread)
             "UNKNOWN EXCEPTION       \n%s in %s       \n", pszModule, pszThread);
 }
 
+void LogException(std::exception* pex, const char* pszThread)
+{
+    std::string message = FormatException(pex, pszThread);
+    printf("\n%s", message.c_str());
+}
+
 void PrintException(std::exception* pex, const char* pszThread)
 {
     std::string message = FormatException(pex, pszThread);
@@ -1084,7 +1106,6 @@ boost::filesystem::path GetPidFile()
     return pathPidFile;
 }
 
-#ifndef WIN32
 void CreatePidFile(const boost::filesystem::path &path, pid_t pid)
 {
     FILE* file = fopen(path.string().c_str(), "w");
@@ -1094,7 +1115,6 @@ void CreatePidFile(const boost::filesystem::path &path, pid_t pid)
         fclose(file);
     }
 }
-#endif
 
 bool RenameOver(boost::filesystem::path src, boost::filesystem::path dest)
 {
@@ -1113,8 +1133,36 @@ void FileCommit(FILE *fileout)
 #ifdef WIN32
     _commit(_fileno(fileout));
 #else
+    #if defined(__linux__) || defined(__NetBSD__)
+    fdatasync(fileno(fileout));
+    #else
     fsync(fileno(fileout));
+    #endif
 #endif
+}
+
+int GetFilesize(FILE* file)
+{
+    int nSavePos = ftell(file);
+    int nFilesize = -1;
+    if (fseek(file, 0, SEEK_END) == 0)
+        nFilesize = ftell(file);
+    fseek(file, nSavePos, SEEK_SET);
+    return nFilesize;
+}
+
+// this function tries to make a particular range of a file allocated (corresponding to disk space)
+// it is advisory, and the range specified in the arguments will never contain live data
+void AllocateFileRange(FILE *file, unsigned int offset, unsigned int length) {
+    static const char buf[65536] = {};
+    fseek(file, offset, SEEK_SET);
+    while (length > 0) {
+        unsigned int now = 65536;
+        if (length < now)
+            now = length;
+        fwrite(buf, 1, now, file); // allowed to fail; this function is advisory anyway
+        length -= now;
+    }
 }
 
 void ShrinkDebugFile()
@@ -1122,7 +1170,7 @@ void ShrinkDebugFile()
     // Scroll debug.log if it's getting too big
     boost::filesystem::path pathLog = GetDataDir() / "debug.log";
     FILE* file = fopen(pathLog.string().c_str(), "r");
-    if (file && boost::filesystem::file_size(pathLog) > 10 * 1000000)
+    if (file && GetFilesize(file) > 10 * 1000000)
     {
         // Restart the file with some of the end
         char pch[200000];
@@ -1139,6 +1187,13 @@ void ShrinkDebugFile()
     }
 }
 
+
+
+
+
+
+
+
 //
 // "Never go to sea with two chronometers; take one or three."
 // Our three time sources are:
@@ -1146,35 +1201,34 @@ void ShrinkDebugFile()
 //  - Median of other nodes clocks
 //  - The user (asking the user to fix the system clock if the first two disagree)
 //
-static int64_t nMockTime = 0;  // For unit testing
+static int64 nMockTime = 0;  // For unit testing
 
-int64_t GetTime()
+int64 GetTime()
 {
     if (nMockTime) return nMockTime;
 
     return time(NULL);
 }
 
-void SetMockTime(int64_t nMockTimeIn)
+void SetMockTime(int64 nMockTimeIn)
 {
     nMockTime = nMockTimeIn;
 }
 
-static int64_t nTimeOffset = 0;
+static int64 nTimeOffset = 0;
 
-int64_t GetTimeOffset()
+int64 GetAdjustedTime()
+{
+    return GetTime() + nTimeOffset;
+}
+
+int64 GetTimeOffset()
 {
     return nTimeOffset;
 }
-
-int64_t GetAdjustedTime()
+void AddTimeData(const CNetAddr& ip, int64 nTime)
 {
-    return GetTime() + GetTimeOffset();
-}
-
-void AddTimeData(const CNetAddr& ip, int64_t nTime)
-{
-    int64_t nOffsetSample = nTime - GetTime();
+    int64 nOffsetSample = nTime - GetTime();
 
     // Ignore duplicates
     static set<CNetAddr> setKnown;
@@ -1183,11 +1237,11 @@ void AddTimeData(const CNetAddr& ip, int64_t nTime)
 
     // Add data
     vTimeOffsets.input(nOffsetSample);
-    printf("Added time data, samples %d, offset %+"PRId64" (%+"PRId64" minutes)\n", vTimeOffsets.size(), nOffsetSample, nOffsetSample/60);
+    printf("Added time data, samples %d, offset %+"PRI64d" (%+"PRI64d" minutes)\n", vTimeOffsets.size(), nOffsetSample, nOffsetSample/60);
     if (vTimeOffsets.size() >= 5 && vTimeOffsets.size() % 2 == 1)
     {
-        int64_t nMedian = vTimeOffsets.median();
-        std::vector<int64_t> vSorted = vTimeOffsets.sorted();
+        int64 nMedian = vTimeOffsets.median();
+        std::vector<int64> vSorted = vTimeOffsets.sorted();
         // Only let other nodes change our time by so much
         if (abs64(nMedian) < 70 * 60)
         {
@@ -1202,7 +1256,7 @@ void AddTimeData(const CNetAddr& ip, int64_t nTime)
             {
                 // If nobody has a time different than ours but within 5 minutes of ours, give a warning
                 bool fMatch = false;
-                BOOST_FOREACH(int64_t nOffset, vSorted)
+                BOOST_FOREACH(int64 nOffset, vSorted)
                     if (nOffset != 0 && abs64(nOffset) < 5 * 60)
                         fMatch = true;
 
@@ -1217,11 +1271,11 @@ void AddTimeData(const CNetAddr& ip, int64_t nTime)
             }
         }
         if (fDebug) {
-            BOOST_FOREACH(int64_t n, vSorted)
-                printf("%+"PRId64"  ", n);
+            BOOST_FOREACH(int64 n, vSorted)
+                printf("%+"PRI64d"  ", n);
             printf("|  ");
         }
-        printf("nTimeOffset = %+"PRId64"  (%+"PRId64" minutes)\n", nTimeOffset, nTimeOffset/60);
+        printf("nTimeOffset = %+"PRI64d"  (%+"PRI64d" minutes)\n", nTimeOffset, nTimeOffset/60);
     }
 }
 
@@ -1287,6 +1341,28 @@ boost::filesystem::path GetSpecialFolderPath(int nFolder, bool fCreate)
     return fs::path("");
 }
 #endif
+
+boost::filesystem::path GetTempPath() {
+#if BOOST_FILESYSTEM_VERSION == 3
+    return boost::filesystem::temp_directory_path();
+#else
+    // TODO: remove when we don't support filesystem v2 anymore
+    boost::filesystem::path path;
+#ifdef WIN32
+    char pszPath[MAX_PATH] = "";
+
+    if (GetTempPathA(MAX_PATH, pszPath))
+        path = boost::filesystem::path(pszPath);
+#else
+    path = boost::filesystem::path("/tmp");
+#endif
+    if (path.empty() || !boost::filesystem::is_directory(path)) {
+        printf("GetTempPath(): failed to find temp path\n");
+        return boost::filesystem::path("");
+    }
+    return path;
+#endif
+}
 
 void runCommand(std::string strCommand)
 {

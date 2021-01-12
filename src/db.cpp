@@ -427,7 +427,7 @@ bool CDB::Rewrite(const string& strFile, const char* pszSkip)
                 return fSuccess;
             }
         }
-        MilliSleep(100);
+        Sleep(100);
     }
     return false;
 }
@@ -464,7 +464,7 @@ void CDBEnv::Flush(bool fShutdown)
             else
                 mi++;
         }
-        printf("DBFlush(%s)%s ended %15"PRId64"ms\n", fShutdown ? "true" : "false", fDbEnvInit ? "" : " db not started", GetTimeMillis() - nStart);
+        printf("DBFlush(%s)%s ended %15"PRI64d"ms\n", fShutdown ? "true" : "false", fDbEnvInit ? "" : " db not started", GetTimeMillis() - nStart);
         if (fShutdown)
         {
             char** listp;

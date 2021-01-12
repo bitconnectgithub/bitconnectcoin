@@ -253,7 +253,7 @@ const char* GetOpName(opcodetype opcode)
     }
 }
 
-static bool IsCanonicalPubKey(const valtype &vchPubKey) {
+bool IsCanonicalPubKey(const valtype &vchPubKey) {
     if (vchPubKey.size() < 33)
         return error("Non-canonical public key: too short");
     if (vchPubKey[0] == 0x04) {
@@ -268,7 +268,7 @@ static bool IsCanonicalPubKey(const valtype &vchPubKey) {
     return true;
 }
 
-static bool IsCanonicalSignature(const valtype &vchSig) {
+bool IsCanonicalSignature(const valtype &vchSig) {
     // See https://bitcointalk.org/index.php?topic=8392.msg127623#msg127623
     // A canonical signature exists of: <30> <total len> <02> <len R> <R> <02> <len S> <S> <hashtype>
     // Where R and S are not negative (their first byte has its highest bit not set), and not
@@ -1185,10 +1185,9 @@ uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int
     }
 
     // Serialize and hash
-    CDataStream ss(SER_GETHASH, 0);
-    ss.reserve(10000);
+    CHashWriter ss(SER_GETHASH, 0);
     ss << txTmp << nHashType;
-    return Hash(ss.begin(), ss.end());
+    return ss.GetHash();
 }
 
 
@@ -2028,4 +2027,130 @@ void CScript::SetMultisig(int nRequired, const std::vector<CKey>& keys)
     BOOST_FOREACH(const CKey& key, keys)
         *this << key.GetPubKey();
     *this << EncodeOP_N(keys.size()) << OP_CHECKMULTISIG;
+}
+
+
+bool CScriptCompressor::IsToKeyID(CKeyID &hash) const
+{
+    if (script.size() == 25 && script[0] == OP_DUP && script[1] == OP_HASH160 
+                            && script[2] == 20 && script[23] == OP_EQUALVERIFY
+                            && script[24] == OP_CHECKSIG) {
+        memcpy(&hash, &script[3], 20);
+        return true;
+    }
+    return false;
+}
+
+bool CScriptCompressor::IsToScriptID(CScriptID &hash) const
+{
+    if (script.size() == 23 && script[0] == OP_HASH160 && script[1] == 20
+                            && script[22] == OP_EQUAL) {
+        memcpy(&hash, &script[2], 20);
+        return true;
+    }
+    return false;
+}
+
+bool CScriptCompressor::IsToPubKey(std::vector<unsigned char> &pubkey) const
+{
+    if (script.size() == 35 && script[0] == 33 && script[34] == OP_CHECKSIG
+                            && (script[1] == 0x02 || script[1] == 0x03)) {
+        pubkey.resize(33);
+        memcpy(&pubkey[0], &script[1], 33);
+        return true;
+    }
+    if (script.size() == 67 && script[0] == 65 && script[66] == OP_CHECKSIG
+                            && script[1] == 0x04) {
+        pubkey.resize(65);
+        memcpy(&pubkey[0], &script[1], 65);
+        CKey key;
+        return (key.SetPubKey(CPubKey(pubkey))); // SetPubKey fails if this is not a valid public key, a case that would not be compressible
+    }
+    return false;
+}
+
+bool CScriptCompressor::Compress(std::vector<unsigned char> &out) const
+{
+    CKeyID keyID;
+    if (IsToKeyID(keyID)) {
+        out.resize(21);
+        out[0] = 0x00;
+        memcpy(&out[1], &keyID, 20);
+        return true;
+    }
+    CScriptID scriptID;
+    if (IsToScriptID(scriptID)) {
+        out.resize(21);
+        out[0] = 0x01;
+        memcpy(&out[1], &scriptID, 20);
+        return true;
+    }
+    std::vector<unsigned char> pubkey;
+    if (IsToPubKey(pubkey)) {
+        out.resize(33);
+        memcpy(&out[1], &pubkey[1], 32);
+        if (pubkey[0] == 0x02 || pubkey[0] == 0x03) {
+            out[0] = pubkey[0];
+            return true;
+        } else if (pubkey[0] == 0x04) {
+            out[0] = 0x04 | (pubkey[64] & 0x01);
+            return true;
+        }
+    }
+    return false;
+}
+
+unsigned int CScriptCompressor::GetSpecialSize(unsigned int nSize) const
+{
+    if (nSize == 0 || nSize == 1)
+        return 20;
+    if (nSize == 2 || nSize == 3 || nSize == 4 || nSize == 5)
+        return 32;
+    return 0;
+}
+
+bool CScriptCompressor::Decompress(unsigned int nSize, const std::vector<unsigned char> &in)
+{
+    switch(nSize) {
+    case 0x00:
+        script.resize(25);
+        script[0] = OP_DUP;
+        script[1] = OP_HASH160;
+        script[2] = 20;
+        memcpy(&script[3], &in[0], 20);
+        script[23] = OP_EQUALVERIFY;
+        script[24] = OP_CHECKSIG;
+        return true;
+    case 0x01:
+        script.resize(23);
+        script[0] = OP_HASH160;
+        script[1] = 20;
+        memcpy(&script[2], &in[0], 20);
+        script[22] = OP_EQUAL;
+        return true;
+    case 0x02:
+    case 0x03:
+        script.resize(35);
+        script[0] = 33;
+        script[1] = nSize;
+        memcpy(&script[2], &in[0], 32);
+        script[34] = OP_CHECKSIG;
+        return true;
+    case 0x04:
+    case 0x05:
+        std::vector<unsigned char> vch(33, 0x00);
+        vch[0] = nSize - 2;
+        memcpy(&vch[1], &in[0], 32);
+        CKey key;
+        if (!key.SetPubKey(CPubKey(vch)))
+            return false;
+        key.SetCompressedPubKey(false); // Decompress public key
+        CPubKey pubkey = key.GetPubKey();
+        script.resize(67);
+        script[0] = 65;
+        memcpy(&script[1], &pubkey.Raw()[0], 65);
+        script[66] = OP_CHECKSIG;
+        return true;
+    }
+    return false;
 }

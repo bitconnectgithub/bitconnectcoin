@@ -7,7 +7,6 @@
 #include "db.h"
 #include "net.h"
 #include "init.h"
-#include "strlcpy.h"
 #include "addrman.h"
 #include "ui_interface.h"
 
@@ -164,7 +163,7 @@ bool RecvLine(SOCKET hSocket, string& strLine)
                     continue;
                 if (nErr == WSAEWOULDBLOCK || nErr == WSAEINTR || nErr == WSAEINPROGRESS)
                 {
-                    MilliSleep(10);
+                    Sleep(10);
                     continue;
                 }
             }
@@ -903,7 +902,7 @@ void ThreadSocketHandler2(void* parg)
             }
             FD_ZERO(&fdsetSend);
             FD_ZERO(&fdsetError);
-            MilliSleep(timeout.tv_usec/1000);
+            Sleep(timeout.tv_usec/1000);
         }
 
 
@@ -1062,7 +1061,7 @@ void ThreadSocketHandler2(void* parg)
                 pnode->Release();
         }
 
-        MilliSleep(10);
+        Sleep(10);
     }
 }
 
@@ -1184,7 +1183,7 @@ void ThreadMapPort2(void* parg)
                 else
                     printf("UPnP Port Mapping successful.\n");;
             }
-            MilliSleep(2000);
+            Sleep(2000);
             i++;
         }
     } else {
@@ -1196,7 +1195,7 @@ void ThreadMapPort2(void* parg)
         {
             if (fShutdown || !fUseUPnP)
                 return;
-            MilliSleep(2000);
+            Sleep(2000);
         }
     }
 }
@@ -1229,7 +1228,12 @@ void MapPort()
 // The first name is used as information source for addrman.
 // The second name should resolve to a list of seed addresses.
 static const char *strDNSSeed[][2] = {
-    {"198.211.115.116", "198.211.115.116"}
+    {"bccnode1", "217.155.202.191"},
+    {"bccnode2", "73.77.117.188"},
+    {"bccnode3", "47.156.38.83"},
+    {"bccnode4", "103.125.234.117"},
+    {"bccnode5", "24.230.34.197"},
+    {"bccnode6", "198.211.115.116"},
 };
 
 void ThreadDNSAddressSeed(void* parg)
@@ -1309,7 +1313,7 @@ void DumpAddresses()
     CAddrDB adb;
     adb.Write(addrman);
 
-    printf("Flushed %d addresses to peers.dat  %"PRId64"ms\n",
+    printf("Flushed %d addresses to peers.dat  %"PRI64d"ms\n",
            addrman.size(), GetTimeMillis() - nStart);
 }
 
@@ -1320,7 +1324,7 @@ void ThreadDumpAddress2(void* parg)
     {
         DumpAddresses();
         vnThreadsRunning[THREAD_DUMPADDRESS]--;
-        MilliSleep(600000);
+        Sleep(600000);
         vnThreadsRunning[THREAD_DUMPADDRESS]++;
     }
     vnThreadsRunning[THREAD_DUMPADDRESS]--;
@@ -1416,12 +1420,12 @@ void ThreadOpenConnections2(void* parg)
                 OpenNetworkConnection(addr, NULL, strAddr.c_str());
                 for (int i = 0; i < 10 && i < nLoop; i++)
                 {
-                    MilliSleep(500);
+                    Sleep(500);
                     if (fShutdown)
                         return;
                 }
             }
-            MilliSleep(500);
+            Sleep(500);
         }
     }
 
@@ -1432,7 +1436,7 @@ void ThreadOpenConnections2(void* parg)
         ProcessOneShot();
 
         vnThreadsRunning[THREAD_OPENCONNECTIONS]--;
-        MilliSleep(500);
+        Sleep(500);
         vnThreadsRunning[THREAD_OPENCONNECTIONS]++;
         if (fShutdown)
             return;
@@ -1556,10 +1560,10 @@ void ThreadOpenAddedConnections2(void* parg)
                 CAddress addr;
                 CSemaphoreGrant grant(*semOutbound);
                 OpenNetworkConnection(addr, &grant, strAddNode.c_str());
-                MilliSleep(500);
+                Sleep(500);
             }
             vnThreadsRunning[THREAD_ADDEDCONNECTIONS]--;
-            MilliSleep(120000); // Retry every 2 minutes
+            Sleep(120000); // Retry every 2 minutes
             vnThreadsRunning[THREAD_ADDEDCONNECTIONS]++;
         }
         return;
@@ -1600,14 +1604,14 @@ void ThreadOpenAddedConnections2(void* parg)
         {
             CSemaphoreGrant grant(*semOutbound);
             OpenNetworkConnection(CAddress(*(vserv.begin())), &grant);
-            MilliSleep(500);
+            Sleep(500);
             if (fShutdown)
                 return;
         }
         if (fShutdown)
             return;
         vnThreadsRunning[THREAD_ADDEDCONNECTIONS]--;
-        MilliSleep(120000); // Retry every 2 minutes
+        Sleep(120000); // Retry every 2 minutes
         vnThreadsRunning[THREAD_ADDEDCONNECTIONS]++;
         if (fShutdown)
             return;
@@ -1727,7 +1731,7 @@ void ThreadMessageHandler2(void* parg)
         // Reduce vnThreadsRunning so StopNode has permission to exit while
         // we're sleeping, but we must always check fShutdown after doing this.
         vnThreadsRunning[THREAD_MESSAGEHANDLER]--;
-        MilliSleep(100);
+        Sleep(100);
         if (fRequestShutdown)
             StartShutdown();
         vnThreadsRunning[THREAD_MESSAGEHANDLER]++;
@@ -1980,7 +1984,7 @@ bool StopNode()
             break;
         if (GetTime() - nStart > 20)
             break;
-        MilliSleep(20);
+        Sleep(20);
     } while(true);
     if (vnThreadsRunning[THREAD_SOCKETHANDLER] > 0) printf("ThreadSocketHandler still running\n");
     if (vnThreadsRunning[THREAD_OPENCONNECTIONS] > 0) printf("ThreadOpenConnections still running\n");
@@ -1995,8 +1999,8 @@ bool StopNode()
     if (vnThreadsRunning[THREAD_DUMPADDRESS] > 0) printf("ThreadDumpAddresses still running\n");
     if (vnThreadsRunning[THREAD_STAKE_MINER] > 0) printf("ThreadStakeMiner still running\n");
     while (vnThreadsRunning[THREAD_MESSAGEHANDLER] > 0 || vnThreadsRunning[THREAD_RPCHANDLER] > 0)
-        MilliSleep(20);
-    MilliSleep(50);
+        Sleep(20);
+    Sleep(50);
     DumpAddresses();
     return true;
 }
