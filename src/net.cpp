@@ -1234,6 +1234,7 @@ static const char *strDNSSeed[][2] = {
     {"bccnode4", "103.125.234.117"},
     {"bccnode5", "24.230.34.197"},
     {"bccnode6", "198.211.115.116"},
+    {"bccnode7", "161.97.157.29"},
 };
 
 void ThreadDNSAddressSeed(void* parg)
