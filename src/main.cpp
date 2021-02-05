@@ -1628,7 +1628,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                 CTxDestination address;
                 ExtractDestination(txout.scriptPubKey, address);
                 CBitcoinAddress bitcoinAddress(address);
-                if (nBestHeight > 1285000 && blacklistedAddresses.find(bitcoinAddress.ToString()) != blacklistedAddresses.end())
+                if (nBestHeight > 1325000 && blacklistedAddresses.find(bitcoinAddress.ToString()) != blacklistedAddresses.end())
                     return DoS(100, error("ConnectBlock() : Tried to spend a blocklisted address at Height = %d", nBestHeight));
             }
 
@@ -1638,7 +1638,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                 CTxDestination address;
                 ExtractDestination(prevout.scriptPubKey, address);
                 CBitcoinAddress bitcoinAddress(address);
-                if (nBestHeight > 1285000 && blacklistedAddresses.find(bitcoinAddress.ToString()) != blacklistedAddresses.end())
+                if (nBestHeight > 1325000 && blacklistedAddresses.find(bitcoinAddress.ToString()) != blacklistedAddresses.end())
                     return DoS(100, error("ConnectBlock() : Tried to spend from a blocklisted address at Height = %d", nBestHeight));
             }
 
